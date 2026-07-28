@@ -2,6 +2,7 @@
 """
 データ取得モジュール
 yfinanceで日本株・米国株・暗号資産の価格履歴をSQLiteに保存する
+ネットワーク制限がある環境では既存DBデータをそのまま活用する
 """
 import sys
 try: sys.stdout.reconfigure(encoding="utf-8")
@@ -9,8 +10,15 @@ except Exception: pass
 
 import sqlite3
 import time
+import warnings
+import logging
 from datetime import datetime, timedelta
 from pathlib import Path
+
+# yfinanceの冗長なログを抑制
+warnings.filterwarnings("ignore")
+logging.getLogger("yfinance").setLevel(logging.CRITICAL)
+
 import yfinance as yf
 import pandas as pd
 
@@ -85,18 +93,44 @@ def init_db():
     return conn
 
 
+def check_db_freshness(conn):
+    """DBの最新日付と銘柄数を返す"""
+    row = conn.execute(
+        "SELECT MAX(date), COUNT(DISTINCT symbol) FROM prices"
+    ).fetchone()
+    latest_date = row[0] or "なし"
+    symbol_count = row[1] or 0
+    return latest_date, symbol_count
+
+
 def fetch_prices(conn, symbols, period="1y"):
+    latest_before, _ = check_db_freshness(conn)
     print(f"\n📥 価格データ取得中 ({len(symbols)}銘柄)...")
+    print(f"   既存DB最新日: {latest_before}")
     c = conn.cursor()
-    ok, ng = 0, 0
+    ok, ng, skipped = 0, 0, 0
 
     for sym in symbols:
         try:
             tk = yf.Ticker(sym)
-            df = tk.history(period=period, auto_adjust=True)
+            # 差分取得：DBの最新日の翌日から今日まで
+            existing = c.execute(
+                "SELECT MAX(date) FROM prices WHERE symbol=?", (sym,)
+            ).fetchone()[0]
+            if existing:
+                start = (datetime.strptime(existing, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
+                today = datetime.now().strftime("%Y-%m-%d")
+                if start > today:
+                    skipped += 1
+                    continue
+                df = tk.history(start=start, end=today, auto_adjust=True)
+            else:
+                df = tk.history(period=period, auto_adjust=True)
+
             if df.empty:
-                ng += 1
+                skipped += 1
                 continue
+
             df.index = df.index.strftime("%Y-%m-%d")
             rows = [
                 (sym, d, row["Open"], row["High"], row["Low"], row["Close"], row["Volume"])
@@ -107,19 +141,25 @@ def fetch_prices(conn, symbols, period="1y"):
             )
             conn.commit()
             ok += 1
-            print(f"  ✓ {sym:<12} {len(rows)}日分")
+            print(f"  ✓ {sym:<12} +{len(rows)}日分")
             time.sleep(0.3)
-        except Exception as e:
-            print(f"  ✗ {sym} — {e}")
+        except Exception:
             ng += 1
 
-    print(f"\n  完了: {ok}成功 / {ng}失敗")
+    latest_after, sym_count = check_db_freshness(conn)
+    if ok > 0:
+        print(f"\n  新規取得: {ok}銘柄  スキップ(最新): {skipped}  失敗: {ng}")
+    elif ng == len(symbols) - skipped:
+        print(f"\n  ⚠️  ネットワーク制限により新規取得不可。既存DB({sym_count}銘柄 / {latest_after})を使用します。")
+    else:
+        print(f"\n  完了: {ok}成功 / {ng}失敗 / {skipped}スキップ")
 
 
 def fetch_fundamentals(conn, symbols):
     print(f"\n📊 ファンダメンタルズ取得中...")
     c = conn.cursor()
     now = datetime.now().strftime("%Y-%m-%d")
+    ok, ng = 0, 0
 
     for sym in symbols:
         if sym.endswith("-USD"):
@@ -127,9 +167,12 @@ def fetch_fundamentals(conn, symbols):
                 "INSERT OR REPLACE INTO fundamentals VALUES (?,?,?,?,?,?,?,?,?)",
                 (sym, sym.replace("-USD",""), "CRYPTO", "Crypto", None, None, None, None, now)
             )
+            ok += 1
             continue
         try:
             info = yf.Ticker(sym).info
+            if not info or info.get("regularMarketPrice") is None and not info.get("longName"):
+                raise ValueError("empty info")
             market = "JP" if sym.endswith(".T") else "US"
             c.execute(
                 "INSERT OR REPLACE INTO fundamentals VALUES (?,?,?,?,?,?,?,?,?)",
@@ -144,19 +187,29 @@ def fetch_fundamentals(conn, symbols):
                  now)
             )
             conn.commit()
+            ok += 1
             time.sleep(0.5)
-        except Exception as e:
-            print(f"  ✗ {sym} — {e}")
+        except Exception:
+            ng += 1
 
-    print("  完了")
+    if ng > 0 and ok <= len([s for s in symbols if s.endswith("-USD")]):
+        print(f"  ⚠️  ファンダメンタルズ取得不可。既存データを使用します。")
+    else:
+        print(f"  完了: {ok}成功 / {ng}失敗")
 
 
 def main():
     conn = init_db()
+    latest, count = check_db_freshness(conn)
+    print(f"📂 DB確認: {count}銘柄 / 最新日 {latest}")
+
     fetch_prices(conn, ALL_SYMBOLS)
     fetch_fundamentals(conn, ALL_SYMBOLS)
     conn.close()
+
+    latest_final, count_final = check_db_freshness(init_db())
     print(f"\n✅ DB保存完了: {DB_PATH}")
+    print(f"   {count_final}銘柄 / 最新日 {latest_final}")
 
 
 if __name__ == "__main__":

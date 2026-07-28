@@ -1,0 +1,40 @@
+name: Daily Stock Report
+
+on:
+  schedule:
+    - cron: '0 23 * * 0-4'  # 毎週月〜金 08:00 JST (UTC 23:00前日)
+  workflow_dispatch:          # 手動実行も可能
+
+permissions:
+  contents: write             # outputs/ への push に必要
+
+jobs:
+  run-report:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install yfinance pandas xgboost scikit-learn joblib requests -q
+
+      - name: Fetch data
+        run: python scripts/fetch_data.py
+        continue-on-error: true   # データ取得失敗でも予測を続行
+
+      - name: Run prediction
+        run: python scripts/predict_today.py
+
+      - name: Commit and push report
+        run: |
+          git config user.email 'noe-stock-ai@auto.run'
+          git config user.name 'NoeStockAI'
+          git add outputs/
+          git diff --cached --quiet || git commit -m "Daily report $(date +%Y-%m-%d)"
+          git push
